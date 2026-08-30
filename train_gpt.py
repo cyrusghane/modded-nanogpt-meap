@@ -1776,6 +1776,53 @@ class Shard:
             return result['shard']
         return get
 
+# -----------------------------------------------------------------------------
+# MEAP-style input masking (experiment; off by default)
+#
+# Replace a fraction p of INPUT tokens with a [MASK] placeholder. Targets are
+# untouched and attention stays causal, so this is a difficulty/augmentation knob
+# on the existing NTP objective, not a change of objective. See arXiv 2502.07490.
+#
+# The mask must be applied BEFORE every input-derived quantity is computed, or the
+# true token leaks around it: input_seq feeds (1) self.embed, (2) the bigram sign
+# trick, (3) self.value_embeds, and (4) get_bigram_hash. Masking in the data
+# generator, ahead of the bigram hash, covers all four from one place.
+#
+# [MASK] costs no new parameters: the vocab is padded 50257 -> 50304, so rows
+# 50257..50303 are unused and already have (tied) embedding rows to learn.
+MASK_ID = 50257
+MASK_P_START = float(os.environ.get("MASK_P_START", 0.0))
+MASK_P_END = float(os.environ.get("MASK_P_END", MASK_P_START))
+MASK_SEED = int(os.environ.get("MASK_SEED", 0))
+
+# Dedicated RNG. Drawing masks from the global RNG would make the init and the data
+# order depend on p, which would confound every baseline-vs-treatment comparison.
+_mask_gen = torch.Generator()
+
+class _MaskState:
+    p: float = 0.0
+    seeded: bool = False
+
+MASK_STATE = _MaskState()
+
+def mask_p_for_step(step: int, total_steps: int) -> float:
+    """Linear anneal of the mask ratio from MASK_P_START to MASK_P_END over training.
+    Setting both to the same value gives a flat ratio; both 0.0 is the unmodified baseline."""
+    if MASK_P_START == 0.0 and MASK_P_END == 0.0:
+        return 0.0
+    t = min(1.0, step / max(total_steps, 1))
+    return MASK_P_START + (MASK_P_END - MASK_P_START) * t
+
+def apply_token_mask(inputs: Tensor, p: float, rank: int) -> Tensor:
+    if p <= 0.0:
+        return inputs
+    if not MASK_STATE.seeded:
+        _mask_gen.manual_seed(MASK_SEED * 1009 + rank)
+        MASK_STATE.seeded = True
+    m = torch.rand(inputs.shape, generator=_mask_gen) < p
+    m &= inputs != BOS_ID  # keep document boundaries intact
+    return torch.where(m, torch.full_like(inputs, MASK_ID), inputs)
+
 def get_bigram_hash(x):
     """
     Computes bigram hash for each position using [prev_token, curr_token].
@@ -1793,7 +1840,7 @@ def get_bigram_hash(x):
     out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
     return out
 
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True, apply_mask: bool = False):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -1857,6 +1904,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+        # Masking goes here: ahead of the bigram hash, so every input-derived feature
+        # sees the mask. _targets is deliberately left alone.
+        if apply_mask:
+            _inputs = apply_token_mask(_inputs, MASK_STATE.p, rank)
         _bigram_inputs = get_bigram_hash(_inputs)
 
         new_params = yield (
@@ -2231,6 +2282,16 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+# Optional init seeding. The record does not seed at all, so run-to-run spread (~0.002
+# val loss) mixes init variance with kernel nondeterminism. Fixing the init lets a
+# baseline and a masked run share it, which pairs the comparison and cancels the init
+# component. It does not make runs bit-identical -- FP8/atomics/flex-attention remain
+# nondeterministic -- so the residual spread still has to be measured, not assumed.
+INIT_SEED = os.environ.get("INIT_SEED")
+if INIT_SEED is not None:
+    torch.manual_seed(int(INIT_SEED))
+    torch.cuda.manual_seed_all(int(INIT_SEED))
+
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
@@ -2268,7 +2329,7 @@ print0("Compiling model and warming up kernels (~7 minutes on first execution)",
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, apply_mask=True)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
@@ -2277,6 +2338,7 @@ warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset 
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
+    MASK_STATE.p = mask_p_for_step(step, training_schedule.total_steps)
     model.eval()
     with torch.no_grad():
         inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
@@ -2303,7 +2365,7 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, apply_mask=True)
 
 gc.collect()
 
@@ -2320,6 +2382,7 @@ train_steps = training_schedule.total_steps
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
+    MASK_STATE.p = mask_p_for_step(step, train_steps)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
