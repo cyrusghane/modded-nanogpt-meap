@@ -65,6 +65,15 @@ check("same seed and rank reproduces the mask", bool((a == b).all()))
 check("different rank gives a different mask", not bool((a == c).all()))
 check("different MASK_SEED gives a different mask", not bool((a == d).all()))
 
+print("warmup does not shift the mask stream")
+w = load({"MASK_P_START": "0.15", "MASK_SEED": "3"})
+for _ in range(5):  # stand-in for the warmup batches
+    w["apply_token_mask"](toks, 0.15, rank=0)
+w["MASK_STATE"].seeded = False  # what train_gpt.py does when it resets the model
+check("reseeding after warmup reproduces the fresh-start mask", bool((w["apply_token_mask"](toks, 0.15, rank=0) == a).all()))
+check("train_gpt.py reseeds the mask RNG at the post-warmup reset",
+      "MASK_STATE.seeded = False" in SRC.split('print0("Resetting Model"', 1)[1].split("Training and validation", 1)[0])
+
 print("the mask RNG does not disturb the global RNG")
 torch.manual_seed(11)
 before = torch.rand(4)

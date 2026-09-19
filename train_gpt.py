@@ -1821,7 +1821,7 @@ def apply_token_mask(inputs: Tensor, p: float, rank: int) -> Tensor:
         MASK_STATE.seeded = True
     m = torch.rand(inputs.shape, generator=_mask_gen) < p
     m &= inputs != BOS_ID  # keep document boundaries intact
-    return torch.where(m, torch.full_like(inputs, MASK_ID), inputs)
+    return torch.where(m, MASK_ID, inputs)
 
 def get_bigram_hash(x):
     """
@@ -2358,6 +2358,7 @@ print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
+MASK_STATE.seeded = False  # reseed on first real batch, so the mask stream does not depend on how many warmup steps ran
 del val_loader, train_loader, initial_state
 model.quantize_mlp_fp8(bootstrap_down=True)
 model.train()

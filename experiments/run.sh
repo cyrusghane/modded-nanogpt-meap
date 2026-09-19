@@ -11,9 +11,18 @@
 #   done
 #
 # Annealed arm:  --arm masked --p 0.15 --p-end 0.0 --seed $s
+#
+# Step removal:  --arm masked --p 0.15 --seed $s --steps 1255
+#   --steps sets num_scheduled_iterations (default 1270). The run is that plus the 15
+#   extension steps, so 1255 means 15 steps removed. Compare against the FULL baseline.
+#
+# Noise floor:   --arm baseline --seed $s --rep 2
+#   Same seed, same arm, run again. The spread between replicates is the run-to-run noise
+#   that pairing CANNOT cancel (kernel nondeterminism), so it sets the smallest effect the
+#   paired design can detect. Measure it before spending the budget on screening.
 set -euo pipefail
 
-ARM=baseline; P=0.0; P_END=""; SEED=1; STEPS=""; GPUS=${GPUS:-8}
+ARM=baseline; P=0.0; P_END=""; SEED=1; STEPS=""; REP=1; GPUS=${GPUS:-8}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arm) ARM="$2"; shift 2;;
@@ -21,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --p-end) P_END="$2"; shift 2;;
     --seed) SEED="$2"; shift 2;;
     --steps) STEPS="$2"; shift 2;;       # override num_scheduled_iterations for step-removal tests
+    --rep) REP="$2"; shift 2;;           # replicate index: an identical rerun that does not overwrite rep 1
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -33,7 +43,8 @@ export MASK_SEED="$SEED"
 export INIT_SEED="$SEED"        # pairs the arms: same init, different objective
 
 TAG="${ARM}_p${MASK_P_START}-${MASK_P_END}_seed${SEED}${STEPS:+_steps${STEPS}}"
-OUT="experiments/logs/${TAG}"
+[[ "$REP" != "1" ]] && TAG="${TAG}_rep${REP}"
+OUT="${LOG_ROOT:-experiments/logs}/${TAG}"   # LOG_ROOT: remote launchers point this at persistent storage
 mkdir -p "$OUT"
 
 # The step count is a module constant, so a step-removal test edits it into a scratch copy
@@ -43,14 +54,20 @@ if [[ -n "$STEPS" ]]; then
   SCRIPT="${OUT}/train_gpt.py"
   sed "s/^    num_scheduled_iterations: int = .*/    num_scheduled_iterations: int = ${STEPS}/" train_gpt.py > "$SCRIPT"
   grep -n "num_scheduled_iterations: int" "$SCRIPT" | head -1
+  # train_gpt.py opens and imports its kernel files relative to its own directory, so
+  # they have to sit next to the scratch copy or it dies before the first import.
+  cp triton_kernels.py dc_triton_kernels.py "$OUT/"
 fi
 
 {
-  echo "commit:  $(git rev-parse HEAD)"
-  echo "dirty:   $(git status --porcelain -- train_gpt.py | wc -l | tr -d ' ') tracked change(s) to train_gpt.py"
+  # GIT_COMMIT / GIT_DIRTY: set by launchers that ship the files without the .git directory
+  echo "commit:  ${GIT_COMMIT:-$(git rev-parse HEAD)}"
+  echo "dirty:   ${GIT_DIRTY:-$(git status --porcelain -- train_gpt.py | wc -l | tr -d ' ')} tracked change(s) to train_gpt.py"
   echo "arm:     $ARM"
   echo "p:       $MASK_P_START -> $MASK_P_END"
   echo "seed:    $SEED (init and mask)"
+  echo "steps:   ${STEPS:-default}"
+  echo "rep:     $REP"
   echo "gpus:    $GPUS"
 } | tee "$OUT/config.txt"
 
