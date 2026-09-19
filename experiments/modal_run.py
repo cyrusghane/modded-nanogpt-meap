@@ -57,8 +57,14 @@ vol = modal.Volume.from_name("nanogpt-masking", create_if_missing=True)
 # Only the four files a run needs, baked into the image (copy=True): an explicit list keeps
 # the 280MB records/ directory out, and an image layer is an ordinary writable directory,
 # which train_gpt.py needs for its own logs/. Editing train_gpt.py rebuilds this layer only.
+# The base has to be a CUDA *devel* image, not debian_slim: triton_kernels.py compiles its
+# cross-entropy kernel with NVRTC at import, and that kernel includes toolkit headers
+# (cuda_bf16.h, math_constants.h) from a hard-coded /usr/local/cuda/include. torch's pip wheel
+# ships the CUDA runtime but not those headers. 12.8 matches the torch 2.10 +cu128 wheel, and
+# this is the same family of base image as the repo's own Dockerfile.
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])                  # drop NVIDIA's banner entrypoint
     .apt_install("build-essential")  # Triton compiles a small C launcher stub at runtime
     .pip_install_from_requirements(str(REPO / "requirements.txt"))
     .env({
@@ -74,6 +80,7 @@ image = (
         # while the H100 is already billing.
         "TIKTOKEN_CACHE_DIR": f"{VOL}/cache/tiktoken",
         "DATA_PATH": VOL,              # train_gpt.py reads $DATA_PATH/data/fineweb10B/*.bin
+        "CUDA_HOME": "/usr/local/cuda",  # torch's NVRTC path raises if this is unset
     })
     .add_local_file(str(REPO / "train_gpt.py"), "/repo/train_gpt.py", copy=True)
     .add_local_file(str(REPO / "triton_kernels.py"), "/repo/triton_kernels.py", copy=True)
@@ -193,6 +200,17 @@ def run_preflight():
     fn(torch.randn(4096, device="cuda"))
     print(f"torch.compile ok in {time.time() - t:.1f}s; cache files inductor/triton: {before} -> {[count(d) for d in caches]}"
           f"  ({'warm: the Volume cache persisted' if any(before) else 'cold: run preflight again to confirm it persists'})")
+
+    # The check that would have caught the first failed port check: compile the real NVRTC
+    # kernel from triton_kernels.py with the real arguments. Compile only, because loading
+    # sm_90 code needs the H100 itself.
+    import re
+    from torch.cuda._utils import _nvrtc_compile
+    ns = {}
+    exec(re.search(r"^CE_KERNEL_BLOCK_SIZE = .*?(?=^ce_fwd_bwd_kernel = )", open("/repo/triton_kernels.py").read(), re.M | re.S).group(0), ns)
+    out = _nvrtc_compile(ns["CE_KERNEL_DECLS"] + ns["CE_KERNEL_SOURCE"], "ce_fwd_bwd_kernel", compute_capability="90",
+                         cuda_include_dirs=["/usr/local/cuda/include/"], nvcc_options=["-lineinfo", "--use_fast_math"])
+    print(f"NVRTC cross-entropy kernel compiles for sm_90: {len(out[0])} bytes (CUDA_HOME={os.environ.get('CUDA_HOME')})")
 
     import tiktoken  # train_gpt.py does this at import; doing it here puts the vocab on the Volume
     print("tiktoken gpt2 vocab:", tiktoken.get_encoding("gpt2").n_vocab, "cached in", os.environ["TIKTOKEN_CACHE_DIR"],
