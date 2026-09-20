@@ -11,6 +11,10 @@ Reported in the repo's own format so the numbers drop straight into a PR table:
 
 Convention: a NEGATIVE mean difference means the masked arm reached a LOWER (better)
 validation loss than its paired baseline.
+
+Runs made with --copy-mix also get a within-run report: the copy-mixture loss and the model's
+own loss come from the same weights and the same forward passes, so there is nothing to pair
+and no seed noise to average away. There the GAIN is reported, and positive is better.
 """
 import re
 import sys
@@ -27,6 +31,14 @@ LOSS_PER_STEP = (3.28091 - 3.27894) / 15
 
 VAL_RE = re.compile(r"step:(\d+)/(\d+) val_loss:([0-9.]+)")
 TIME_RE = re.compile(r"train_time:([0-9.]+)ms")
+VAL_TIME_RE = re.compile(r"step:(\d+)/\d+ val_loss:[0-9.]+ train_time:([0-9.]+)ms")
+COPY_RE = re.compile(r"^step:(\d+)/\d+ copy_mix base:([0-9.]+) mix:([0-9.]+) gain:(-?[0-9.]+) match_ms:(\d+) fit_ms:(\d+)", re.M)
+COPY_ROW_RE = re.compile(r"^copy_mix_table step:(\d+) len:(\d+) dist:(\S+) share:([0-9.]+) hit:([0-9.]+) lam:([0-9.]+) "
+                         r"loss:([0-9.]+) mix:([0-9.]+) gain:(-?[0-9.]+)", re.M)
+WS_RE = re.compile(r"^step:\d+/\d+ eval_ws:(\d+:\d+) loss:([0-9.]+)( \(the record's windows\))?", re.M)
+# Smallest step saving worth a PR: the maintainer has merged -5 (PR 350). Below CONTINUE_STEPS the
+# record evidence (about 8 runs) costs more of the month's credit than the result is likely worth.
+DROP_STEPS, CONTINUE_STEPS = 5, 10
 
 
 def read_run(d: Path):
@@ -55,6 +67,10 @@ def read_run(d: Path):
         loss=float(vals[-1][2]),
         curve=curve,
         time_ms=float(times[-1]) if times else None,
+        val_times={int(step): float(ms) for step, ms in VAL_TIME_RE.findall(text)},
+        copy={int(m[0]): tuple(float(x) for x in m[1:]) for m in COPY_RE.findall(text)},
+        copy_rows=[(int(m[0]), int(m[1]), m[2]) + tuple(float(x) for x in m[3:]) for m in COPY_ROW_RE.findall(text)],
+        eval_ws=[(ws, float(loss), bool(rec)) for ws, loss, rec in WS_RE.findall(text)],
     )
 
 
@@ -96,7 +112,7 @@ def noise_floor(groups):
     if not reps:
         print("no same-seed replicates yet, so the paired noise floor is unmeasured.\n"
               "  run.sh --arm baseline --seed S --rep 2   (before spending the budget on screening)\n")
-        return
+        return None
     ss = sum((r["loss"] - mean(x["loss"] for x in v)) ** 2 for v in reps.values() for r in v)
     n, g = sum(len(v) for v in reps.values()), len(reps)
     sd = (ss / (n - g)) ** 0.5
@@ -112,6 +128,7 @@ def noise_floor(groups):
     need = lambda delta: max(6, ceil((2.8 * sd_pair / delta) ** 2))
     print("     pairs needed to detect a loss difference of "
           + ", ".join(f"{d} (~{d / LOSS_PER_STEP:.0f} steps): {need(d)}" for d in (0.001, 0.002, 0.003)) + "\n")
+    return sd_pair
 
 
 def permutation_p(diffs):
@@ -128,6 +145,77 @@ def permutation_p(diffs):
         if abs(mean(s * d for s, d in zip(signs, diffs))) >= observed - 1e-15
     )
     return hits / 2 ** n
+
+
+def copy_mix_report(runs):
+    """Within-run gain of the document-local copy mixture (positive = lower loss). One run is a
+    measurement: the two losses share their weights and their forward passes. More runs only show
+    how much the gain itself moves with the weights."""
+    runs = [r for r in runs if r["copy"]]
+    if not runs:
+        return
+    print("copy mixture: eval-only, measured within each run (gain = model loss - mixture loss; positive is better)")
+    gains, nets = [], []
+    for r in runs:
+        last = max(r["copy"])
+        base, mix, gain, match_ms, fit_ms = r["copy"][last]
+        # The weight fit is on the clock. Price it in steps of this run's own final stretch, with the
+        # fit itself taken back out of that stretch. One GPU runs the fit's 8 forwards and a step's 8
+        # micro-batches both in sequence, so the ratio is the one that carries over to 8 GPUs.
+        prev = max((s for s in r["val_times"] if s < last), default=None)
+        fit_steps = None
+        if prev is not None and last in r["val_times"]:
+            step_ms = (r["val_times"][last] - r["val_times"][prev] - fit_ms) / (last - prev)
+            fit_steps = fit_ms / step_ms
+        gains.append(gain)
+        nets.append(gain / LOSS_PER_STEP - (fit_steps or 0.0))
+        print(f"  {r['name']:<44} {base:.6f} -> {mix:.6f}  gain {gain:+.6f}  (~{gain / LOSS_PER_STEP:.0f} steps)"
+              + (f"  fit {fit_ms:.0f} ms on the clock = {fit_steps:.1f} steps" if fit_steps is not None else "")
+              + f"  matching {match_ms:.0f} ms off the clock")
+    # Rule 2 is judged on the loss a record reports, which for this change is the mixture's. Never pool
+    # step counts: a shortened run and a full-length one are different submissions.
+    by_steps = {}
+    for r in runs:
+        by_steps.setdefault(r["steps"], []).append(r["copy"][max(r["copy"])][1])
+    for steps, mixes in sorted(by_steps.items()):
+        print("  " + summarize(f"mixture loss, steps={steps}", mixes))
+    spread = f" +/- {stdev(gains):.6f}" if len(gains) > 1 else ""
+    net = mean(nets)
+    verdict = ("DROP: below the smallest saving worth a PR" if net < DROP_STEPS else
+               "MARGINAL: mergeable in principle, thin against the cost of record evidence" if net < CONTINUE_STEPS else
+               "CONTINUE: cut --steps by about this much and collect record evidence")
+    print(f"  final gain {mean(gains):+.6f}{spread} (n={len(gains)}), net of the fit ~{net:.0f} steps at {LOSS_PER_STEP:.5f} loss/step\n"
+          f"  => {verdict}  (drop < {DROP_STEPS} steps <= marginal < {CONTINUE_STEPS} <= continue)")
+    shared = sorted(set.intersection(*(set(r["copy"]) for r in runs)))
+    print("  gain by checkpoint (same weights at every row, so early rows are real here; step 500 sits on a stage switch):")
+    for step in shared:
+        gs = [r["copy"][step][2] for r in runs]
+        print(f"    step {step:>5}: {mean(gs):+.6f}" + (f" +/- {stdev(gs):.6f}" if len(gs) > 1 else ""))
+    # Final-checkpoint table, averaged over runs: where the gain comes from, and what the fit chose.
+    cells = {}
+    for r in runs:
+        for step, length, dist, *vals in r["copy_rows"]:
+            if step == max(r["copy"]):
+                cells.setdefault((length, dist), []).append(vals)
+    order = {d: i for i, d in enumerate(dict.fromkeys(d for _, d in cells))}
+    print(f"  final table, mean over runs  {'len':>4} {'dist':>7} {'share':>8} {'hit':>6} {'lam':>6} {'loss':>8} {'mix':>8} {'gain':>10}")
+    for (length, dist), vals in sorted(cells.items(), key=lambda kv: (kv[0][0], order[kv[0][1]])):
+        share, hit, lam, loss, mix, gain = (mean(v[i] for v in vals) for i in range(6))
+        print(f"  {'':<29}{length:>4} {dist:>7} {share:>8.3%} {hit:>6.3f} {lam:>6.3f} {loss:>8.4f} {mix:>8.4f} {gain:>+10.6f}")
+    print()
+
+
+def eval_ws_report(runs):
+    """Eval-window candidates rescored on a run's final weights (NEGATIVE = lower loss than the record's windows)."""
+    for r in runs:
+        record = [loss for _, loss, is_record in r["eval_ws"] if is_record]
+        if not record:
+            continue
+        print(f"eval windows on the final weights of {r['name']} (short:long in blocks of 128; record's windows: {record[0]:.6f})")
+        for ws, loss, is_record in sorted(r["eval_ws"], key=lambda e: e[1]):
+            if not is_record:
+                print(f"    {ws:>6}  {loss:.6f}  ({loss - record[0]:+.6f}, ~{(record[0] - loss) / LOSS_PER_STEP:+.0f} steps)")
+        print()
 
 
 def main(root):
@@ -148,9 +236,12 @@ def main(root):
         (base if label == "baseline" else treat.setdefault(label, {}))[seed] = merge(reps)
 
     print(f"{len(runs)} run(s)\n")
-    noise_floor(groups)
+    sd_pair = noise_floor(groups)
     if base:
         print(summarize("baseline", [r["loss"] for r in base.values()]))
+        print()
+    copy_mix_report(runs)
+    eval_ws_report(runs)
 
     for label, arm in sorted(treat.items()):
         print(summarize(label, [r["loss"] for r in arm.values()]))
@@ -167,6 +258,14 @@ def main(root):
         floor = 2 / 2 ** len(diffs)
         print(f"  mean diff {mean(diffs):+.5f} +/- {sd:.5f}   p={permutation_p(diffs):.4f}"
               f"  (floor {floor:.4f} at n={len(diffs)})")
+        # The sign-flip test is assumption-free but blind below n=6. The paired t-test assumes
+        # roughly normal differences and in exchange can speak at n=3, which is what a capped
+        # screen produces. Report both; when they disagree at small n, that is the reason.
+        t_p = None
+        if len(diffs) > 1 and sd > 0:
+            t = mean(diffs) / (sd / len(diffs) ** 0.5)
+            t_p = 2 * min(t_cdf(t, len(diffs) - 1), 1 - t_cdf(t, len(diffs) - 1))
+            print(f"  paired t-test: t={t:+.1f} on {len(diffs) - 1} df, two-sided p={t_p:.4f}")
         if all(arm[s]["steps"] == "default" for s in seeds):
             print(f"  worth roughly {-mean(diffs) / LOSS_PER_STEP:+.0f} steps at ~{LOSS_PER_STEP:.5f} loss/step "
                   f"(upstream's 1375-vs-1390 baselines; use it to pick --steps, not as a result)")
@@ -197,8 +296,15 @@ def main(root):
         if unpaired:
             print(f"  ignored (no baseline at that seed): {', '.join(unpaired)}")
         if len(diffs) < 5:
-            print(f"  WARNING: n={len(diffs)} is too small to conclude anything. Published "
-                  f"baseline spread is ~0.002; keep going.")
+            if t_p is not None and t_p < 0.01:
+                # Three differences can agree by luck, so judge the effect against the LARGER of
+                # their own spread and the measured replicate noise per pair, when there is one.
+                noise = max(sd, sd_pair or 0.0)
+                print(f"  n={len(diffs)} is small, but every pair agrees and the effect is {abs(mean(diffs)) / noise:.0f}x the "
+                      f"per-pair noise ({noise:.5f}): the direction is not in doubt, only the exact size.")
+            else:
+                print(f"  WARNING: n={len(diffs)} is too small to conclude anything. Published "
+                      f"baseline spread is ~0.002; keep going.")
         print()
 
 

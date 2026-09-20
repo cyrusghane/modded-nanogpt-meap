@@ -100,7 +100,11 @@ check("masking precedes get_bigram_hash in the generator", -1 < i_mask < i_bigra
 check("targets are never masked", "apply_token_mask(_targets" not in SRC)
 check("val loader does not mask (apply_mask defaults to False)",
       "align_to_bos=False, apply_mask=True" not in SRC and "apply_mask: bool = False" in SRC)
-check("both train loaders mask", SRC.count("args.train_files") == SRC.count("apply_mask=True") == 2)
+# Counted by loader, not by mentions of args.train_files: the copy-mixture weight fit also reads a
+# train shard, and must read it unmasked (test_copy_mix.py checks that side).
+train_loaders = re.findall(r"^train_loader = distributed_data_generator\(.*$", SRC, re.M)
+check("both train loaders mask", len(train_loaders) == SRC.count("apply_mask=True") == 2 and
+      all("args.train_files" in l and "apply_mask=True" in l for l in train_loaders))
 
 print()
 if FAILURES:

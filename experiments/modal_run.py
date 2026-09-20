@@ -18,6 +18,13 @@ Paired block (baseline + masked at each seed, fanned out in parallel):
     modal run experiments/modal_run.py --p 0.15 --seeds 1,2,3,4 --steps 1255      # 15 steps removed
     modal run experiments/modal_run.py --arm baseline --seeds 1,2 --rep 2         # noise floor
 
+Copy mixture (eval-only, so one run measures it: both losses come from the same weights):
+    modal run experiments/modal_run.py --copy-stats                               # CPU only, about a cent: match statistics, no model
+    modal run experiments/modal_run.py --arm baseline --seeds 4 --copy-mix
+    modal run experiments/modal_run.py --arm baseline --seeds 5 --copy-mix --eval-ws 6:26,8:20
+    modal run experiments/modal_run.py --copy-offline baseline_p0.0-0.0_seed4_copymix   # CPU only: rescore mixture designs on that run's dump
+The final per-token losses of a --copy-mix run are kept on the Volume under dumps/<tag>/.
+
 A closed laptop kills a plain `modal run` and the credit spent so far is wasted. Either keep
 the Mac awake (`caffeinate -i modal run ...`) or use `modal run --detach ...`: every run also
 saves its logs to the Volume, and any later invocation (or `--fetch` alone) pulls them down.
@@ -115,7 +122,10 @@ def download_data(num_chunks: int = 9):
 # is a different experiment (pre-Hopper cards also need DISABLE_FP8=1), so never mix GPU
 # types inside one paired comparison.
 GPU = os.environ.get("MODAL_GPU", "H100!")
-USD_PER_RUN = 1.50  # planning figure with headroom: ~19 min cold / ~13 min warm at USD_PER_SEC. Replace once measured.
+# Measured 2026-09-20 over 7 runs: $0.83-0.88 when the compile cache hits (12 min), $1.39-1.58 when
+# it misses (20-22 min), $2.11 for the very first run (30 min). Mean $1.37. The cache missed for
+# all four containers of the first parallel batch even though the marker said warm; cause unknown.
+USD_PER_RUN = 1.40
 USD_PER_SEC = 0.001097 + 4 * 0.0000131 + 16 * 0.00000222  # H100 + 4 cores + 16 GiB, modal.com/pricing 2026-09
 KEEP = ("config.txt", "train.log", "train.failed.log")
 RUN_LOGS = "/tmp/run_logs"  # inside the container
@@ -139,7 +149,7 @@ def _cache_key() -> str:
 @app.function(image=image, gpu=GPU, cpu=4.0, memory=16384, volumes={VOL: vol}, timeout=60 * 60,
               max_containers=4, scaledown_window=5)
 def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_commit: str, git_dirty: str,
-          cache_key: str):
+          cache_key: str, copy_mix: str = "0", eval_ws: str = ""):
     t0 = time.time()
     if not os.path.isdir(f"{VOL}/data/fineweb10B"):
         raise RuntimeError("no data on the Volume -- run `modal run experiments/modal_run.py --setup` first")
@@ -153,8 +163,21 @@ def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_com
         cmd += ["--steps", steps]
     if rep != "1":
         cmd += ["--rep", rep]
-    env = {**os.environ, "GPUS": "1", "LOG_ROOT": log_root, "GIT_COMMIT": git_commit, "GIT_DIRTY": git_dirty}
+    if copy_mix == "1":
+        cmd += ["--copy-mix"]
+    if eval_ws:
+        cmd += ["--eval-ws", eval_ws]
+    env = {**os.environ, "GPUS": "1", "LOG_ROOT": log_root, "GIT_COMMIT": git_commit, "GIT_DIRTY": git_dirty,
+           "DUMP_ROOT": f"{VOL}/dumps"}
     proc = subprocess.run(cmd, cwd="/repo", env=env)
+    # A failure inside the first two minutes is an import-time failure and costs about a cent.
+    # One of them was transient: `kernels` checks the flash-attn3 publisher against the HF Hub
+    # on every load, even with the kernel cached, and the connection was reset. Retry once.
+    if proc.returncode != 0 and time.time() - t0 < 120:
+        print("run failed within 2 minutes; retrying once in 20 s in case it was transient")
+        time.sleep(20)
+        shutil.rmtree(log_root, ignore_errors=True)
+        proc = subprocess.run(cmd, cwd="/repo", env=env)
 
     (tag,) = os.listdir(log_root)
     out = Path(log_root) / tag
@@ -230,6 +253,171 @@ def run_preflight():
     vol.commit()
 
 
+@app.function(image=image, volumes={VOL: vol}, cpu=4.0, memory=8192, timeout=20 * 60, scaledown_window=5)
+def run_copy_stats():
+    """Ceiling check for the copy mixture, CPU only (about a cent). Runs the document-local matcher
+    from train_gpt.py over the validation tokens, chunked exactly as the val loader chunks them, and
+    reports how often it fires at each length and distance and how often its token is the target.
+    No model is involved, so this bounds the gain; it does not measure it. The same table for the
+    tokens the mixture weights would be fitted on shows whether train statistics transfer."""
+    import glob, re
+    from math import log
+    import numpy as np
+    import torch
+
+    ns = {"torch": torch, "Tensor": torch.Tensor, "os": os, "BOS_ID": 50256, "dist": torch.distributed}
+    exec(re.search(r"^# Document-local copy mixture.*?(?=^# -{20,}\n# Training Management)",
+                   open("/repo/train_gpt.py").read(), re.M | re.S).group(0), ns)
+    lengths, n_dist = [s[0] for s in ns["COPY_SPLITS"]], len(ns["COPY_DISTS"]) + 1
+    dist_names = [f"<={ns['COPY_DISTS'][0]}"] + [f"<={d}" for d in ns["COPY_DISTS"][1:]] + [f">{ns['COPY_DISTS'][-1]}"]
+    chunk = 4 * 64 * 1024 * 8 // 8  # val_batch_size // 8: one validation forward, on 1 GPU and on 8 alike
+
+    def table(path, n_tokens):
+        tokens = torch.from_numpy(np.fromfile(path, dtype=np.uint16, offset=256 * 4, count=n_tokens + 1).astype(np.int32))
+        n, hits = torch.zeros(ns["COPY_NUM_BUCKETS"]), torch.zeros(ns["COPY_NUM_BUCKETS"])
+        for i in range(0, n_tokens, chunk):  # mirrors the align_to_bos=False branch of distributed_data_generator
+            inputs, targets = tokens[i:i + chunk], tokens[i + 1:i + chunk + 1]
+            cand, bucket = ns["copy_candidates"](inputs)
+            n += torch.bincount(bucket, minlength=len(n))
+            hits += torch.bincount(bucket[cand == targets], minlength=len(n))
+        share, q = n / n_tokens, hits / n.clamp(min=1)
+        out = [f"{path}: first {n_tokens:,} tokens, {(tokens[:-1] == 50256).sum():,} documents",
+               f"no match: {share[0]:.2%} of tokens.   Cells: share of all tokens / hit rate",
+               f"{'len':>5}" + "".join(f"{d:>20}" for d in dist_names) + f"{'all distances':>20}"]
+        for k, L in enumerate(lengths):
+            b = slice(1 + k * n_dist, 1 + (k + 1) * n_dist)
+            cells = [f"{s:>11.3%} / {h:.3f}" for s, h in zip(share[b], q[b])]
+            out.append(f"{L:>5}" + "".join(f"{c:>20}" for c in cells)
+                       + f"{share[b].sum():>11.3%} / {hits[b].sum() / n[b].sum().clamp(min=1):.3f}")
+        # If the model already gives the proposed token a fraction alpha of its true hit rate q, the
+        # best mixture weight gains exactly KL(Bernoulli(q) || Bernoulli(alpha q)) per token of the cell.
+        kl = lambda q, a: 0.0 if q <= 0 else q * log(1 / a) + ((1 - q) * log((1 - q) / (1 - a * q)) if q < 1 else 0.0)
+        out.append("gain in val loss if the model already captures a fraction alpha of each cell's hit rate:")
+        # Short matches carry most tokens, and there the model (bigram table included) should beat the
+        # copy rule outright, so the columns that matter are the long-match ones.
+        out.append(f"{'alpha':>7}" + "".join(f"{d:>12}" for d in dist_names) + f"{'total':>12}{'len>=4':>12}{'len>=8':>12}")
+        for a in (0.95, 0.9, 0.75, 0.5):
+            g = torch.tensor([0.0] + [share[b].item() * kl(q[b].item(), a) for b in range(1, len(n))])
+            by_dist = [g[1 + d::n_dist].sum() for d in range(n_dist)]
+            out.append(f"{a:>7}" + "".join(f"{v:>12.5f}" for v in by_dist) + f"{g.sum():>12.5f}"
+                       + f"{g[1 + lengths.index(4) * n_dist:].sum():>12.5f}{g[1 + lengths.index(8) * n_dist:].sum():>12.5f}")
+        return out
+
+    data = f"{VOL}/data/fineweb10B"
+    text = "\n".join(table(f"{data}/fineweb_val_000000.bin", 10485760) + [""]
+                     + table(sorted(glob.glob(f"{data}/fineweb_train_*.bin"))[-1], 4 * 64 * 1024 * 8))
+    print(text)
+    return text
+
+
+@app.function(image=image, volumes={VOL: vol}, cpu=4.0, memory=16384, timeout=30 * 60, scaledown_window=5)
+def run_copy_offline(tag: str):
+    """Train once, evaluate many: rescore copy-mixture DESIGNS on the per-token losses a finished
+    --copy-mix run left on the Volume. CPU only, a cent or two, and exact rather than approximate: a
+    mixture whose second component ignores the model needs only the model's probability of the target.
+
+    Designs are ranked on TRAIN tokens (weights fitted on half of the fit set, scored on the other half,
+    both ways), so the choice of design never looks at validation. The validation column is the number
+    that design would have printed in the run; the oracle column fits on validation itself and is only a
+    ceiling on what better weight-fitting could still buy. The first row must reproduce the run's log."""
+    import glob, re
+    import numpy as np
+    import torch
+
+    ns = {"torch": torch, "Tensor": torch.Tensor, "os": os, "BOS_ID": 50256, "dist": torch.distributed}
+    exec(re.search(r"^# Document-local copy mixture.*?(?=^# -{20,}\n# Training Management)",
+                   open("/repo/train_gpt.py").read(), re.M | re.S).group(0), ns)
+    dump = torch.load(f"{VOL}/dumps/{tag}/rank0.pt")
+    chunk = 4 * 64 * 1024 * 8 // 8
+    levels = len(ns["COPY_SPLITS"])
+
+    def match(x):
+        """The shipped matcher's loop, keeping what it throws away: the source position at the longest
+        level and whether the occurrence before that one continued the same way."""
+        N, xl = x.numel(), x.long()
+        ar = torch.arange(N)
+        is_bos = xl == 50256
+        pos_in_doc = ar - torch.cummax(ar * is_bos, 0).values
+        ranks, prevs = {}, []
+        for L, left, right in ns["COPY_SPLITS"]:
+            key = (torch.cumsum(is_bos, 0) * 65536 + xl if L == 1 else
+                   torch.where(pos_in_doc >= L - 1, ranks[left].roll(right) * N + ranks[right], -1 - ar))
+            ranks[L], prev = ns["_rank_and_prev"](key)
+            prevs.append(prev)
+        prevs = torch.stack(prevs)
+        len_idx = (prevs >= 0).sum(0) - 1  # matches are nested, so the count of levels that matched names the longest
+        k = len_idx.clamp(min=0)
+        src = torch.where(len_idx >= 0, prevs[k, ar], -1)
+        src2 = prevs[k, src.clamp(min=0)]
+        agree = torch.where(src2 < 0, 0, torch.where(xl[(src2 + 1).clamp(min=0)] == xl[(src + 1).clamp(min=0)], 1, 2))
+        return src, len_idx, agree, xl[(src + 1).clamp(min=0)]
+
+    def features(path, loss):
+        n = loss.numel()
+        tokens = torch.from_numpy(np.fromfile(path, dtype=np.uint16, offset=256 * 4, count=n + 1).astype(np.int32))
+        cols = []
+        for i in range(0, n, chunk):
+            x, y = tokens[i:i + chunk], tokens[i + 1:i + chunk + 1]
+            src, len_idx, agree, cand = match(x)
+            dist = torch.arange(chunk) - src
+            shipped_cand, shipped_bucket = ns["copy_candidates"](x)  # the scorer's matcher must be the run's matcher
+            mine = torch.where(len_idx >= 0, 1 + len_idx * (len(ns["COPY_DISTS"]) + 1)
+                               + torch.bucketize(dist, torch.tensor(ns["COPY_DISTS"])), 0)
+            assert torch.equal(mine, shipped_bucket) and torch.equal(cand[len_idx >= 0], shipped_cand[len_idx >= 0])
+            cols.append((cand == y, len_idx, dist, agree, torch.full((chunk,), i // chunk)))
+        hit, len_idx, dist, agree, part = (torch.cat(c) for c in zip(*cols))
+        return dict(loss=loss.float(), hit=hit, len_idx=len_idx, dist=dist, agree=agree, part=part)
+
+    data = f"{VOL}/data/fineweb10B"
+    val = features(f"{data}/fineweb_val_000000.bin", dump["val_loss"])
+    fit = features(sorted(glob.glob(f"{data}/fineweb_train_*.bin"))[-1], dump["fit_loss"])
+
+    def design(dists=(768, 2560), agree=False, by_len=True):
+        def bucket(f):
+            b = torch.bucketize(f["dist"], torch.tensor(dists, dtype=torch.int64))
+            b = b + (len(dists) + 1) * (f["len_idx"].clamp(min=0) if by_len else 0)
+            if agree:
+                b = b * 3 + f["agree"]
+            return torch.where(f["len_idx"] >= 0, 1 + b, 0)
+        return bucket, 1 + (len(dists) + 1) * (levels if by_len else 1) * (3 if agree else 1)
+
+    def gain(bucket_fn, n_buckets, train, test, **fit_args):
+        ns["COPY_NUM_BUCKETS"] = n_buckets  # copy_fit sizes its sums from this global
+        lam = ns["copy_fit"](train["loss"], train["hit"], bucket_fn(train), **fit_args)
+        mix = ns["copy_mix_loss"](test["loss"].double(), test["hit"], lam[bucket_fn(test)])
+        return (test["loss"].double() - mix).mean().item(), lam
+
+    half = lambda f, odd: {k: v[(f["part"] % 2 == 1) == odd] for k, v in f.items()}
+    base = val["loss"].double().mean().item()
+    g0, lam0 = gain(*design(), fit, val)
+    out = [f"{tag}: base {base:.6f}, shipped design rescored offline: mix {base - g0:.6f} gain {g0:.6f}; "
+           f"max |lam - the run's lam| = {(lam0 - dump['lam']).abs().max().item():.2e}",
+           f"{'design':<58}{'buckets':>8}{'train, cross-fit':>18}{'validation':>12}{'oracle':>10}"]
+    designs = [("shipped: length x distance (768, 2560)", {}, {}),
+               ("length only (the memo's definition)", dict(dists=()), {}),
+               ("distance only", dict(by_len=False), {}),
+               ("+ edge at the trained long window: (768, 1664, 2560)", dict(dists=(768, 1664, 2560)), {}),
+               ("+ edge at the paired heads' reach: (384, 768, 1664, 2560)", dict(dists=(384, 768, 1664, 2560)), {}),
+               ("+ far edge: (768, 1664, 2560, 5120)", dict(dists=(768, 1664, 2560, 5120)), {}),
+               ("shipped + previous occurrence agrees", dict(agree=True), {}),
+               ("(768, 1664, 2560) + previous occurrence agrees", dict(dists=(768, 1664, 2560), agree=True), {}),
+               ("shipped, prior_miss 1", {}, dict(prior_miss=1.0)),
+               ("shipped, prior_miss 20", {}, dict(prior_miss=20.0)),
+               ("shipped, lam_max 0.995", {}, dict(lam_max=0.995))]
+    for name, d, fit_args in designs:
+        fn, nb = design(**d)
+        cross = (gain(fn, nb, half(fit, False), half(fit, True), **fit_args)[0]
+                 + gain(fn, nb, half(fit, True), half(fit, False), **fit_args)[0]) / 2
+        out.append(f"{name:<58}{nb:>8}{cross:>18.6f}{gain(fn, nb, fit, val, **fit_args)[0]:>12.6f}"
+                   f"{gain(fn, nb, val, val, **fit_args)[0]:>10.6f}")
+    fn, nb = design()
+    out.append(f"{'shipped, weights fitted on half the fit tokens':<58}{nb:>8}{'':>18}"
+               f"{(gain(fn, nb, half(fit, False), val)[0] + gain(fn, nb, half(fit, True), val)[0]) / 2:>12.6f}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 def _fetch(logs: Path) -> int:
     """Pull finished logs off the Volume. Makes `modal run --detach` and dropped connections
     harmless: the skip check below then sees runs that finished while nobody was watching."""
@@ -266,23 +454,35 @@ def _cache_is_warm(key: str) -> bool:
         return False
 
 
-def _tag(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str = "1") -> str:
+def _tag(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str = "1", copy_mix: bool = False) -> str:
     """Mirror of TAG in run.sh. Only used to skip finished runs; the directory actually
     written uses the tag run.sh reports, so a drift here costs a rerun, not a wrong result."""
     if arm == "baseline":
         p, p_end = "0.0", ""
-    return f"{arm}_p{p}-{p_end or p}_seed{seed}" + (f"_steps{steps}" if steps else "") + (f"_rep{rep}" if rep != "1" else "")
+    return (f"{arm}_p{p}-{p_end or p}_seed{seed}" + (f"_steps{steps}" if steps else "") + ("_copymix" if copy_mix else "")
+            + (f"_rep{rep}" if rep != "1" else ""))
 
 
 @app.local_entrypoint()
 def main(arm: str = "pair", p: str = "0.15", p_end: str = "", seeds: str = "1", steps: str = "", rep: str = "1",
          setup: bool = False, preflight: bool = False, fetch: bool = False, max_runs: int = 8,
-         budget: float = 30.0):
+         budget: float = 30.0, copy_stats: bool = False, copy_mix: bool = False, eval_ws: str = "",
+         copy_offline: str = ""):
     if setup:
         download_data.remote()
         return
     if preflight:
         run_preflight.remote()
+        return
+    if copy_offline:  # the tag of a finished --copy-mix run, e.g. baseline_p0.0-0.0_seed4_copymix
+        out = REPO / "experiments" / "logs" / f"copy_offline_{copy_offline}.txt"
+        out.write_text(run_copy_offline.remote(copy_offline) + "\n")
+        print(f"\nsaved to {out}")
+        return
+    if copy_stats:
+        out = REPO / "experiments" / "logs" / "copy_stats.txt"
+        out.write_text(run_copy_stats.remote() + "\n")
+        print(f"\nsaved to {out}")
         return
     logs = REPO / "experiments" / "logs"
     pulled = _fetch(logs)
@@ -303,10 +503,10 @@ def main(arm: str = "pair", p: str = "0.15", p_end: str = "", seeds: str = "1", 
         for a in (("baseline", "masked") if arm == "pair" else (arm,)):
             # A step-removal test compares a SHORT masked run against the FULL baseline.
             s = "" if (arm == "pair" and a == "baseline") else steps
-            if (logs / _tag(a, p, p_end, seed, s, rep) / "train.log").exists():
-                print(f"skip  {_tag(a, p, p_end, seed, s, rep)} (already have it)")
+            if (logs / _tag(a, p, p_end, seed, s, rep, copy_mix) / "train.log").exists():
+                print(f"skip  {_tag(a, p, p_end, seed, s, rep, copy_mix)} (already have it)")
             else:
-                jobs.append((a, p, p_end, seed, s, rep, commit, dirty, key))
+                jobs.append((a, p, p_end, seed, s, rep, commit, dirty, key, "1" if copy_mix else "0", eval_ws))
     if not jobs:
         print("nothing to run")
         return
