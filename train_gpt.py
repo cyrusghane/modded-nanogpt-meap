@@ -2252,6 +2252,114 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             max_seq_len = new_max_seq_len
 
 # -----------------------------------------------------------------------------
+# Document-local copy mixture at the final validation (COPY_MIX=0 turns it off)
+#
+# P'(x) = (1 - lam_b) * P_model(x) + lam_b * [x == c]. c is the token that followed the most
+# recent earlier occurrence, in the same document, of the longest suffix of the context that
+# occurs earlier at all; b buckets that match by length and by distance. c and b depend on the
+# inputs up to the current position only, so P' is causal and sums to one: still a valid
+# probability model. The model is untouched: all of this runs eagerly on the per-token loss
+# the eval forward already returns.
+COPY_MIX = os.environ.get("COPY_MIX", "1") == "1"
+# Match lengths tried, each assembled from two shorter ones: (length, left part, right part).
+COPY_SPLITS = ((1, 0, 0), (2, 1, 1), (3, 2, 1), (4, 2, 2), (6, 4, 2), (8, 4, 4), (12, 8, 4), (16, 8, 8), (24, 16, 8), (32, 16, 16))
+COPY_DISTS = (768, 2560)  # distance split at the final short and long attention windows, in tokens
+COPY_NUM_BUCKETS = 1 + len(COPY_SPLITS) * (len(COPY_DISTS) + 1)  # bucket 0: no match
+
+def _rank_and_prev(key: Tensor):
+    """Dense rank of every key, and the latest earlier position holding the same key (-1 if none)."""
+    sorted_key, order = torch.sort(key, stable=True)  # stable: equal keys stay in position order
+    first = torch.ones_like(sorted_key, dtype=torch.bool)
+    first[1:] = sorted_key[1:] != sorted_key[:-1]
+    rank, prev = torch.empty_like(order), torch.empty_like(order)
+    rank[order] = torch.cumsum(first, 0) - 1
+    prev[order] = torch.where(first, -1, order.roll(1))
+    return rank, prev
+
+def copy_candidates(inputs: Tensor):
+    """(cand, bucket) per position, from inputs[:t+1] alone; targets are never read.
+    Exact, no hashing: the rank of an L-gram is the rank of the pair (rank of its left part,
+    rank of its right part), so equal ranks mean equal token strings. The document index is
+    folded into the length-1 rank, which keeps every longer match inside one document."""
+    N = inputs.numel()
+    x = inputs.long()
+    ar = torch.arange(N, device=x.device)
+    is_bos = x == BOS_ID
+    pos_in_doc = ar - torch.cummax(ar * is_bos, 0).values  # a chunk may open mid-document: that fragment is its own document
+    ranks = {}
+    src = torch.full_like(ar, -1)
+    len_idx = torch.zeros_like(ar)
+    for k, (L, left, right) in enumerate(COPY_SPLITS):
+        if L == 1:
+            key = torch.cumsum(is_bos, 0) * 65536 + x
+        else:
+            key = ranks[left].roll(right) * N + ranks[right]
+            key = torch.where(pos_in_doc >= L - 1, key, -1 - ar)  # an L-gram cut by the document start matches nothing
+        ranks[L], prev = _rank_and_prev(key)
+        found = prev >= 0  # nested: a match at L implies one at every shorter length
+        src = torch.where(found, prev, src)
+        len_idx = torch.where(found, k, len_idx)
+    matched = src >= 0
+    cand = x[(src + 1).clamp(min=0)]  # src + 1 <= t: the copied token is itself part of the context
+    dist_idx = torch.bucketize(ar - src, torch.tensor(COPY_DISTS, device=x.device))
+    bucket = torch.where(matched, 1 + len_idx * (len(COPY_DISTS) + 1) + dist_idx, 0)
+    return cand, bucket
+
+def copy_mix_loss(loss: Tensor, hit: Tensor, lam: Tensor):
+    """-log P'(target), from the model's own -log P(target) and whether the target is the copied token.
+    lam is per token. Where lam is 0 this returns loss bit for bit."""
+    keep = torch.log1p(-lam)
+    both = -torch.logaddexp(keep - loss, torch.log(lam))
+    return torch.where(hit & (lam > 0), both, loss - keep)
+
+def copy_fit(loss: Tensor, hit: Tensor, bucket: Tensor, iters: int = 40, lam_max: float = 0.98, prior_miss: float = 5.0):
+    """Maximum-likelihood mixture weight per bucket. The log-likelihood is concave in lam, with derivative
+    sum_hits (1-p)/(p + lam (1-p)) - n_miss/(1-lam), so bisect on its sign; a bucket the copy rule cannot
+    help keeps lam at exactly 0. prior_miss phantom misses per bucket pull thinly populated buckets toward 0,
+    which is the model's own loss. Sums are all-reduced, so every rank ends with identical weights."""
+    p = torch.exp(-loss.double())
+    n_miss = torch.bincount(bucket[~hit], minlength=COPY_NUM_BUCKETS).double()
+    if dist.is_initialized():
+        dist.all_reduce(n_miss)
+    n_miss += prior_miss
+    hit_bucket, hit_p = bucket[hit], p[hit]
+    lo, hi = torch.zeros_like(n_miss), torch.full_like(n_miss, lam_max)
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        grad = torch.zeros_like(n_miss).index_add_(0, hit_bucket, (1 - hit_p) / (hit_p + mid[hit_bucket] * (1 - hit_p)))
+        if dist.is_initialized():
+            dist.all_reduce(grad)
+        up = grad > n_miss / (1 - mid)
+        lo, hi = torch.where(up, mid, lo), torch.where(up, hi, mid)
+    lo[0] = 0.0  # no match, nothing to copy
+    return lo
+
+_copy_fit_batches = []
+
+def copy_fit_on_train(model, forward_args):
+    """Fit the mixture weights on training tokens: eval-mode forwards under no_grad, nothing else. The
+    caller keeps this on the clock. The tokens are the head of the last train shard, which the run never
+    trains on, cut by the unmodified loader exactly like validation batches, so the eval graph that is
+    already compiled serves them and the fit sees documents of validation-like length."""
+    t0 = time.perf_counter()
+    if not _copy_fit_batches:
+        loader = distributed_data_generator(sorted(glob.glob(args.train_files))[-1], args.val_batch_size, -1,
+                                            grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        _copy_fit_batches.extend(next(loader)[:4] for _ in range(grad_accum_steps))
+    model.eval()
+    stats = []
+    with torch.no_grad():
+        for inputs, targets, cum_seqlens, bigram_inputs in _copy_fit_batches:
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, forward_args)
+            cand, bucket = copy_candidates(inputs)
+            stats.append((loss, cand == targets, bucket))
+    model.train()
+    loss, hit, bucket = (torch.cat(s) for s in zip(*stats))
+    lam = copy_fit(loss, hit, bucket)
+    torch.cuda.synchronize()
+    return lam, 1000 * (time.perf_counter() - t0)
+
+# -----------------------------------------------------------------------------
 # Training Management
 
 @dataclass(slots=True)
@@ -2677,6 +2785,12 @@ for step in warmup_steps:
     training_manager.step_optimizers(step)
     model.quantize_attn_fp8()
     model.quantize_mlp_fp8()
+if COPY_MIX:
+    # The eval graph for the final windows is otherwise first met at the last validation, off the clock.
+    # The weight fit runs it on the clock, so compile it here with the rest. reset() below restores the windows.
+    training_manager.apply_final_ws_ext()
+    copy_fit_on_train(model, training_manager.get_forward_args())
+    _copy_fit_batches.clear()  # the timed fit loads its own tokens
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
@@ -2685,6 +2799,31 @@ del val_loader, train_loader, initial_state
 model.quantize_attn_fp8()
 model.quantize_mlp_fp8(update_activation_scales=False)
 model.train()
+
+def validate(copy_lam: Tensor = None):
+    """One pass over the validation tokens, off the clock. Returns the model's loss and, given mixture
+    weights, the copy mixture's loss from the same forward passes."""
+    model.eval()
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    val_loss, copy_loss = 0, 0
+    with torch.no_grad():
+        for _ in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+            loss_per_token = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            val_loss += loss_per_token.mean()
+            if copy_lam is not None:
+                cand, bucket = copy_candidates(inputs)
+                copy_loss += copy_mix_loss(loss_per_token, cand == targets, copy_lam[bucket]).mean()
+    del val_loader
+    val_loss /= val_steps
+    dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+    if copy_lam is not None:
+        copy_loss /= val_steps
+        dist.reduce(copy_loss, 0, op=dist.ReduceOp.AVG)
+    model.train()
+    return val_loss, (copy_loss if copy_lam is not None else None)
 
 ########################################
 #        Training and validation       #
@@ -2721,23 +2860,21 @@ for step in range(train_steps + 1):
             # and broadcast of the result because they are part of the mask's cost.
             canon_mask_builder.wait()
             canon_mask_builder.collect(model.canon_mask)
+        copy_lam = None
+        if COPY_MIX and last_step:
+            # Still on the clock: the mixture weights are fitted parameters, so fitting them is training.
+            # After the canonical mask is in place, so the fit sees the distribution validation will score.
+            # Only the final validation is scored with the mixture, so this is the only fit a run pays for.
+            copy_lam, copy_fit_ms = copy_fit_on_train(model, training_manager.get_forward_args())
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-        val_loss /= val_steps
-        del val_loader
-        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        val_loss, copy_loss = validate(copy_lam)
+        if copy_loss is not None:
+            val_loss, val_loss_no_copy = copy_loss, val_loss
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        model.train()
+        if copy_loss is not None:
+            print0(f"step:{step}/{train_steps} val_loss_no_copy:{val_loss_no_copy:.6f} val_loss_copy:{val_loss:.6f} copy_gain:{val_loss_no_copy - val_loss:.6f} copy_fit_ms:{copy_fit_ms:.0f}", console=True)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
