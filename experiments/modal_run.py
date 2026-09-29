@@ -9,6 +9,12 @@ Evidence for the copy-mixture record (the mixture is on by default; its loss is 
     modal run experiments/modal_run.py --seeds 2,3,4,5,6,7 --ext 25       # 15 extension steps removed
     modal run experiments/modal_run.py --seeds 2 --no-copy-mix            # the unmodified record, for reference
 
+More than one GPU (MODAL_GPUS=2, 4 or 8; tags gain _2gpu etc. so they never mix with 1-GPU runs). ALWAYS
+`modal run --detach` these: a dropped Wi-Fi link or a sleeping laptop otherwise makes Modal cancel the run,
+which has cost $6.50 once. With --detach the run finishes on its own and `--fetch` pulls its logs later:
+    MODAL_GPUS=2 modal run experiments/modal_run.py --seeds 91 --steps 45 --ext 5                 # smoke test of the multi-GPU path, about $2
+    MODAL_GPUS=8 modal run --detach experiments/modal_run.py --seeds 8 --ext 25                  # timing on 8xH100, about $5-10 (cap $17.82)
+
 One-time setup, from the repo root:
     pip install modal && modal setup
     modal run experiments/modal_run.py --setup            # data -> Volume, CPU only, no GPU billed
@@ -26,6 +32,10 @@ Paired block (baseline + masked at each seed, fanned out in parallel):
     modal run experiments/modal_run.py --p 0.15 --p-end 0.0 --seeds 1,2,3,4      # annealed arm
     modal run experiments/modal_run.py --p 0.15 --seeds 1,2,3,4 --steps 1255      # 15 steps removed
     modal run experiments/modal_run.py --arm baseline --seeds 1,2 --rep 2         # noise floor
+
+Compile caches live in ONE file on the Volume, /vol/cache.tar, extracted to local disk at the start of every
+GPU run and re-packed after a run that compiled something new. Seed it once from the old directory caches:
+    modal run --detach experiments/modal_run.py --pack-cache-flag                 # CPU only, cents; --detach: it takes minutes
 
 Copy mixture (eval-only, so one run measures it: both losses come from the same weights):
     modal run experiments/modal_run.py --copy-stats                               # CPU only, about a cent: match statistics, no model
@@ -56,9 +66,11 @@ This wraps experiments/run.sh rather than reimplementing it, so tags and config.
 drift between local and remote runs.
 """
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -103,6 +115,7 @@ image = (
     .add_local_file(str(REPO / "triton_kernels.py"), "/repo/triton_kernels.py", copy=True)
     .add_local_file(str(REPO / "dc_triton_kernels.py"), "/repo/dc_triton_kernels.py", copy=True)
     .add_local_file(str(REPO / "experiments" / "run.sh"), "/repo/experiments/run.sh", copy=True)
+    .add_local_file(str(REPO / "experiments" / "one_gpu_per_rank.py"), "/repo/experiments/one_gpu_per_rank.py", copy=True)
 )
 
 
@@ -132,13 +145,79 @@ def download_data(num_chunks: int = 9):
 # is a different experiment (pre-Hopper cards also need DISABLE_FP8=1), so never mix GPU
 # types inside one paired comparison.
 GPU = os.environ.get("MODAL_GPU", "H100!")
+# MODAL_GPUS=2 or 8 puts that many GPUs on ONE container (torchrun, one rank per GPU). A function's
+# resources are fixed when this file is imported, hence an environment variable and not a flag.
+# Every rank compiles on the CPU while all N GPUs sit idle and billing, so cores and memory scale with N.
+N_GPUS = int(os.environ.get("MODAL_GPUS", "1"))
+assert N_GPUS in (1, 2, 4, 8), "train_gpt.py needs 8 % world_size == 0"
+GPU_SPEC = GPU if N_GPUS == 1 else f"{GPU}:{N_GPUS}"
+# 8 GPUs get 32 GiB per rank: a cold compile forks ~66 inductor workers per rank, and 128 GiB left no headroom.
+CPUS, MEM_GIB = (4.0, 16) if N_GPUS == 1 else (8.0 * N_GPUS, (32 if N_GPUS == 8 else 16) * N_GPUS)
+# A hung multi-GPU run is the one way to overshoot the month's credit: 8xH100 bills about $36/hour.
+# Every rank but 0 compiles cold (compiled graphs are keyed to the rank's own cuda:N, and the cache was filled
+# by cuda:0), and lowering is single-threaded, so a multi-GPU run idles ALL its GPUs for about 15 minutes first.
+# 15 minutes was too tight once (a $2.23 timeout); 30 fits the worst case seen so far, a 17.5-minute cold start.
+TIMEOUT_S = 60 * 60 if N_GPUS == 1 else (15 * 60 if N_GPUS == 2 else 30 * 60)  # 2 GPUs: a $2.23 cap for cheap tests
 # Measured 2026-09-20 over 7 runs: $0.83-0.88 when the compile cache hits (12 min), $1.39-1.58 when
 # it misses (20-22 min), $2.11 for the very first run (30 min). Mean $1.37. The cache missed for
 # all four containers of the first parallel batch even though the marker said warm; cause unknown.
-USD_PER_RUN = 1.40
-USD_PER_SEC = 0.001097 + 4 * 0.0000131 + 16 * 0.00000222  # H100 + 4 cores + 16 GiB, modal.com/pricing 2026-09
-KEEP = ("config.txt", "train.log", "train.failed.log")
+def _usd_per_sec(n: int) -> float:
+    """H100s + cores + GiB at modal.com/pricing 2026-09, for a container with n GPUs."""
+    cpus, mem_gib = (4.0, 16) if n == 1 else (8.0 * n, (32 if n == 8 else 16) * n)
+    return n * 0.001097 + cpus * 0.0000131 + mem_gib * 0.00000222
+
+
+USD_PER_SEC = _usd_per_sec(N_GPUS)  # LOCAL view only: inside the container MODAL_GPUS is unset, so train() is told its GPU count
+# 1 GPU: measured. More: a guess for the budget guard, deliberately high (cold compile on every rank, GPUs idle meanwhile).
+# The compiled graphs depend on the GPU count (parameter banks are padded to a multiple of world_size, and
+# grad_scale = 1/grad_accum_steps is baked in as a constant), so the FIRST run at a given GPU count compiles
+# cold whatever smaller runs have cached: ~13 min measured for 2 ranks on local disk, so ~18 min all told.
+USD_PER_RUN = 1.40 if N_GPUS == 1 else round(USD_PER_SEC * 18 * 60, 2)
+KEEP = ("config.txt", "train.log", "train.failed.log", "run_log.txt")
 RUN_LOGS = "/tmp/run_logs"  # inside the container
+
+
+LOCAL_CACHE = "/tmp/cache"  # inside the container, on local disk
+
+
+def _count_files(d: str) -> int:
+    return sum(len(fs) for _, _, fs in os.walk(d))
+
+
+def _extract_cache(tar_path: str, local: str) -> str:
+    """One sequential read of the Volume, then local-disk speed for the tens of thousands of small files the
+    compile caches are made of. Reading those files straight off the Volume was measured at ~3 min for one
+    rank and ~7 min for two, warm; eight ranks never finished inside 30 min."""
+    os.makedirs(local, exist_ok=True)
+    if not os.path.exists(tar_path):
+        return "no cache.tar on the Volume: caches start empty (run --pack-cache once to seed it from cache/)"
+    t = time.time()
+    if subprocess.run(["tar", "-xf", tar_path, "-C", local]).returncode != 0:
+        shutil.rmtree(local, ignore_errors=True)
+        os.makedirs(local, exist_ok=True)
+        return f"WARNING: {tar_path} is unreadable (truncated?): caches start empty; this run compiles cold"
+    return f"cache.tar ({os.path.getsize(tar_path) >> 20} MiB) extracted to {local} in {time.time() - t:.0f}s: {_count_files(local)} files"
+
+
+def _pack_cache(local: str, tar_path: str) -> str:
+    """Local cache dir -> one tarball on the Volume. Packed locally first so the Volume sees a single write."""
+    t = time.time()
+    tmp = "/tmp/cache.tar"
+    subprocess.run(["tar", "-cf", tmp, "-C", local, "."], check=True)
+    partial = tar_path + ".partial"  # a cancelled copy leaves .partial behind, never a truncated cache.tar
+    shutil.copyfile(tmp, partial)
+    os.replace(partial, tar_path)
+    return f"packed {_count_files(local)} files into {tar_path} ({os.path.getsize(tmp) >> 20} MiB) in {time.time() - t:.0f}s"
+
+
+@app.function(image=image, volumes={VOL: vol}, cpu=4.0, memory=8192, timeout=60 * 60, scaledown_window=5)
+def pack_cache():
+    """One-time, CPU only: turn the directory caches under /vol/cache into /vol/cache.tar, which every GPU run
+    then extracts to local disk at start. Reads each small file once, which is slow (minutes) but costs cents."""
+    src = f"{VOL}/cache"
+    print(f"{_count_files(src)} files under {src}")
+    print(_pack_cache(src, f"{VOL}/cache.tar"))
+    vol.commit()
 
 
 def _cache_key() -> str:
@@ -156,13 +235,45 @@ def _cache_key() -> str:
 # host with nothing to spare. Upstream's 1xH100 logs show 36 GB of GPU memory in use, and the
 # host side holds two pinned 200 MB shards plus the compile workers. A request is not a cap.
 # scaledown_window: an idle container is still billed, and the default keeps it for 60 s.
-@app.function(image=image, gpu=GPU, cpu=4.0, memory=16384, volumes={VOL: vol}, timeout=60 * 60,
+@app.function(image=image, gpu=GPU_SPEC, cpu=CPUS, memory=MEM_GIB * 1024, volumes={VOL: vol}, timeout=TIMEOUT_S,
               max_containers=4, scaledown_window=5)
 def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_commit: str, git_dirty: str,
-          cache_key: str, copy_mix: str = "1", ext: str = ""):
+          cache_key: str, copy_mix: str = "1", ext: str = "", gpus: str = "1", workspace: str = "cyghane",
+          compile_threads: str = ""):
     t0 = time.time()
+    # The GPU count arrives as an argument because this module is imported again inside the container, where
+    # MODAL_GPUS does not exist. A container whose GPUs do not match would bill for hardware the run never
+    # touches (it happened once), so refuse in the first second instead.
+    have = len(subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.strip().splitlines())
+    if have != int(gpus):
+        raise RuntimeError(f"this container has {have} GPU(s) but the run was asked to use {gpus}")
     if not os.path.isdir(f"{VOL}/data/fineweb10B"):
         raise RuntimeError("no data on the Volume -- run `modal run experiments/modal_run.py --setup` first")
+
+    def monitor(stop):
+        """One line a minute while the ranks compile, so that a hang shows and can be stopped (`modal app stop`
+        for a detached run) before it bills the whole timeout. Compile progress is read as the number of
+        inductor compile-worker processes alive: no I/O, and the sandbox's load average is always 0 so CPU
+        load would say nothing. Ranks that have finished and are waiting in a collective show 100% GPU
+        utilisation; ranks still compiling show ~0. Stops for good once the warmup is over: the timed
+        region is never polled."""
+        while not stop.wait(60):
+            logs = list(Path(RUN_LOGS).glob("*/train.log"))
+            if logs and "Resetting Model" in logs[0].read_text(errors="ignore"):
+                return
+            util = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True).stdout.split()
+            procs = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+            workers = procs.count("compile_worker")
+            print(f"[monitor {(time.time() - t0) / 60:4.1f} min] {workers} inductor compile workers alive, "
+                  f"GPU util % {','.join(util)}   (workers = compiling; none, and no GPU at 100, for minutes = hung)", flush=True)
+
+    stop_monitor = threading.Event()
+    if int(gpus) > 1:
+        threading.Thread(target=monitor, args=(stop_monitor,), daemon=True).start()
+
+    print(_extract_cache(f"{VOL}/cache.tar", LOCAL_CACHE), flush=True)
+    files_before = _count_files(LOCAL_CACHE)
 
     log_root = RUN_LOGS  # emptied per call, so the one directory in it afterwards is this run's
     shutil.rmtree(log_root, ignore_errors=True)
@@ -176,8 +287,9 @@ def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_com
     cmd += ["--copy-mix"] if copy_mix == "1" else ["--no-copy-mix"]
     if ext:
         cmd += ["--ext", ext]
-    env = {**os.environ, "GPUS": "1", "LOG_ROOT": log_root, "GIT_COMMIT": git_commit, "GIT_DIRTY": git_dirty,
-           "DUMP_ROOT": f"{VOL}/{VOL_DUMPS}"}
+    env = {**os.environ, "GPUS": gpus, "LOG_ROOT": log_root,
+           # Compile caches on local disk for the run (the image's env points them at the Volume).
+           "TORCHINDUCTOR_CACHE_DIR": f"{LOCAL_CACHE}/inductor", "TRITON_CACHE_DIR": f"{LOCAL_CACHE}/triton", "GIT_COMMIT": git_commit, "GIT_DIRTY": git_dirty}
     proc = subprocess.run(cmd, cwd="/repo", env=env)
     # A failure inside the first two minutes is an import-time failure and costs about a cent.
     # One of them was transient: `kernels` checks the flash-attn3 publisher against the HF Hub
@@ -188,6 +300,7 @@ def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_com
         shutil.rmtree(log_root, ignore_errors=True)
         proc = subprocess.run(cmd, cwd="/repo", env=env)
 
+    stop_monitor.set()
     (tag,) = os.listdir(log_root)
     out = Path(log_root) / tag
     # train.log means "this run finished", to analyze.py and to the skip check alike. A failed
@@ -195,12 +308,17 @@ def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_com
     if proc.returncode != 0 and (out / "train.log").exists():
         (out / "train.log").rename(out / "train.failed.log")
     files = {f"{tag}/{name}": (out / name).read_text() for name in KEEP if (out / name).exists()}
+    # train_gpt.py's own log: the code, the environment and every line. It is what upstream's record
+    # folders hold, and the console capture above lacks its header. The newest one is this attempt's.
+    own = sorted(Path("/repo/logs").glob("*.txt"), key=lambda f: f.stat().st_mtime)
+    if own:
+        files[f"{tag}/run_log.txt"] = own[-1].read_text()
     # One spend record per ATTEMPT, under a unique name, so a rerun or a parallel container can
     # never overwrite another attempt's cost.
     secs = time.time() - t0
     files[f"_spend/{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{tag}.txt"] = (
-        f"date={time.strftime('%Y-%m-%d', time.gmtime())} secs={secs:.0f} usd={secs * USD_PER_SEC:.2f} "
-        f"gpu={GPU} exit={proc.returncode}\n")
+        f"date={time.strftime('%Y-%m-%d', time.gmtime())} secs={secs:.0f} usd={secs * _usd_per_sec(int(gpus)):.2f} "
+        f"gpu={GPU}x{gpus} exit={proc.returncode} ws={workspace}\n")
     for rel, text in files.items():  # the Volume copy survives a dropped connection; _fetch reads it back
         dest = Path(f"{VOL}/{'logs' if rel.startswith('_spend/') else VOL_RUNS}/{rel}")
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +326,8 @@ def train(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str, git_com
     if proc.returncode == 0:
         os.makedirs(f"{VOL}/cache", exist_ok=True)
         Path(f"{VOL}/cache/{cache_key}").touch()
+        if _count_files(LOCAL_CACHE) > files_before:  # this run compiled something new: keep it for the next one
+            print(_pack_cache(LOCAL_CACHE, f"{VOL}/cache.tar"), flush=True)
     vol.commit()  # also persists the compile cache
     return {"tag": tag, "code": proc.returncode, "secs": secs, "files": files}
 
@@ -448,12 +568,32 @@ def _fetch(logs: Path) -> int:
     return n
 
 
-def _spent_this_month(logs: Path):
-    """Sum of this calendar month's spend records (UTC). A floor, not the bill."""
+def _workspace() -> str:
+    """The Modal WORKSPACE the active profile points at (not the profile's name: two profiles can share one
+    workspace, and the credit is the workspace's). Records written before this field existed were all cyghane's."""
+    out = subprocess.run(["modal", "profile", "list", "--json"], capture_output=True, text=True).stdout
+    try:
+        rows = json.loads(out)
+        active = [r for r in rows if r.get("active") or r.get("current")]
+        if active:
+            return active[0].get("workspace") or active[0].get("Workspace") or "unknown"
+    except Exception:
+        pass
+    for line in subprocess.run(["modal", "profile", "list"], capture_output=True, text=True).stdout.splitlines():
+        if "•" in line:  # the table marks the active profile with a bullet: | • | profile | workspace |
+            cells = [c.strip() for c in line.split("│") if c.strip()]
+            if len(cells) >= 3:
+                return cells[-1]
+    return "unknown"
+
+
+def _spent_this_month(logs: Path, workspace: str):
+    """Sum of this calendar month's spend records (UTC) for THIS workspace: the credit is per workspace,
+    and switching accounts must not carry the old one's spend into the new one's budget. A floor, not the bill."""
     month, usd, n = time.strftime("%Y-%m", time.gmtime()), 0.0, 0
     for f in (logs / "_spend").glob("*.txt"):
         kv = dict(x.split("=", 1) for x in f.read_text().split())
-        if kv.get("date", "").startswith(month):
+        if kv.get("date", "").startswith(month) and kv.get("ws", "cyghane") == workspace:
             usd, n = usd + float(kv["usd"]), n + 1
     return usd, n
 
@@ -471,7 +611,7 @@ def _tag(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str = "1", co
     if arm == "baseline":
         p, p_end = "0.0", ""
     return (f"{arm}_p{p}-{p_end or p}_seed{seed}" + (f"_steps{steps}" if steps else "") + (f"_ext{ext}" if ext else "")
-            + ("_copymix" if copy_mix else "")
+            + ("_copymix" if copy_mix else "") + (f"_{N_GPUS}gpu" if N_GPUS != 1 else "")
             + (f"_rep{rep}" if rep != "1" else ""))
 
 
@@ -479,12 +619,15 @@ def _tag(arm: str, p: str, p_end: str, seed: str, steps: str, rep: str = "1", co
 def main(arm: str = "baseline", p: str = "0.15", p_end: str = "", seeds: str = "1", steps: str = "", rep: str = "1",
          setup: bool = False, preflight: bool = False, fetch: bool = False, max_runs: int = 8,
          budget: float = 30.0, copy_stats: bool = False, copy_mix: bool = True, ext: str = "",
-         copy_offline: str = ""):
+         copy_offline: str = "", pack_cache_flag: bool = False, dry_run: bool = False):
     if setup:
         download_data.remote()
         return
     if preflight:
         run_preflight.remote()
+        return
+    if pack_cache_flag:
+        pack_cache.remote()
         return
     if copy_offline:  # the tag of a finished --copy-mix run, e.g. baseline_p0.0-0.0_seed4_copymix
         out = REPO / "experiments" / "logs" / f"copy_offline_{copy_offline}.txt"
@@ -506,6 +649,7 @@ def main(arm: str = "baseline", p: str = "0.15", p_end: str = "", seeds: str = "
         raise SystemExit(f"this code base has no masking: --arm must be baseline (got {arm})")
 
 
+    workspace = _workspace()
     git = lambda *a: subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True).stdout
     commit = git("rev-parse", "HEAD").strip()
     dirty = str(len(git("status", "--porcelain", "--", "train_gpt.py").splitlines()))
@@ -519,7 +663,8 @@ def main(arm: str = "baseline", p: str = "0.15", p_end: str = "", seeds: str = "
             if (logs / _tag(a, p, p_end, seed, s, rep, copy_mix, ext) / "train.log").exists():
                 print(f"skip  {_tag(a, p, p_end, seed, s, rep, copy_mix, ext)} (already have it)")
             else:
-                jobs.append((a, p, p_end, seed, s, rep, commit, dirty, key, "1" if copy_mix else "0", ext))
+                jobs.append((a, p, p_end, seed, s, rep, commit, dirty, key, "1" if copy_mix else "0", ext, str(N_GPUS),
+                             workspace, ""))  # compile_threads: unused since 2026-09-27; the cap made compiles slower, not faster
     if not jobs:
         print("nothing to run")
         return
@@ -528,14 +673,22 @@ def main(arm: str = "baseline", p: str = "0.15", p_end: str = "", seeds: str = "
     if len(jobs) > max_runs:
         raise SystemExit(f"{len(jobs)} runs is roughly ${len(jobs) * USD_PER_RUN:.0f} of the $30 monthly credit and "
                          f"--max-runs is {max_runs}. Pass fewer seeds, or raise --max-runs on purpose.")
-    spent, n_spent = _spent_this_month(logs)
+    spent, n_spent = _spent_this_month(logs, workspace)
     planned = len(jobs) * USD_PER_RUN
     if spent + planned > budget:
         raise SystemExit(f"this month's {n_spent} recorded attempt(s) come to ~${spent:.2f}; {len(jobs)} more at "
                          f"~${USD_PER_RUN:.2f} would reach ~${spent + planned:.2f}, past --budget {budget:.0f}. "
                          f"Run fewer, or raise --budget on purpose.")
-    print(f"{len(jobs)} run(s) on 1x{GPU}, roughly ${planned:.0f}; ~${spent:.2f} already recorded this month "
+    print(f"{len(jobs)} run(s) on {N_GPUS}x{GPU} in workspace '{workspace}', roughly ${planned:.0f} (hard cap per run: ${TIMEOUT_S * USD_PER_SEC:.2f} at the {TIMEOUT_S // 60}-minute timeout); ~${spent:.2f} already recorded this month "
           f"(launcher's count only: the Modal dashboard is the authority).")
+    if dry_run:  # everything above ran (skip check, tags, budget guard); nothing is submitted
+        names = ("arm", "p", "p_end", "seed", "steps", "rep", "git_commit", "git_dirty", "cache_key", "copy_mix", "ext", "gpus",
+                 "workspace", "compile_threads")
+        for job in jobs:
+            print("  would submit train(" + ", ".join(f"{k}={v!r}" for k, v in zip(names, job)) + ")")
+        print(f"  container: gpu={GPU_SPEC!r} cpu={CPUS:.0f} memory={MEM_GIB} GiB timeout={TIMEOUT_S // 60} min; "
+              f"caches: {VOL}/cache.tar -> {LOCAL_CACHE}; run log root {VOL_RUNS}")
+        return
 
     # Parallel cold starts would each pay the full compile (~7 min of H100 apiece). When this
     # code has never finished a run on this GPU type, one job goes first and fills the cache.
@@ -546,14 +699,35 @@ def main(arm: str = "baseline", p: str = "0.15", p_end: str = "", seeds: str = "
 
     def run_batch(batch) -> int:
         ok = 0
-        for result in train.starmap(batch, order_outputs=False, return_exceptions=True):
+        t_batch = time.time()
+        try:
+            results = list(train.starmap(batch, order_outputs=False, return_exceptions=True))
+        except Exception as e:
+            # The call itself failed (e.g. Modal disabled the workspace at the credit limit), so no container
+            # wrote a record. Charge the wall time to every job in the batch: a bound, and better than nothing.
+            secs = time.time() - t_batch
+            for _ in batch:
+                rec = logs / "_spend" / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{type(e).__name__}.txt"
+                rec.parent.mkdir(parents=True, exist_ok=True)
+                rec.write_text(f"date={time.strftime('%Y-%m-%d', time.gmtime())} secs={secs:.0f} usd={secs * USD_PER_SEC:.2f} "
+                               f"gpu={GPU}x{N_GPUS} exit={type(e).__name__}(estimated) ws={workspace}\n")
+            print(f"FAILED before any container reported back: {e!r}\n  ~${secs * USD_PER_SEC:.2f} of {N_GPUS}-GPU time recorded as spent.")
+            raise
+        for result in results:
             if isinstance(result, Exception):
                 print(f"FAILED: {result!r}")
-                if isinstance(result, modal.exception.FunctionTimeoutError):
-                    # The container was killed, so it left no spend record. It still billed the full timeout.
-                    rec = logs / "_spend" / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-timeout.txt"
-                    rec.parent.mkdir(parents=True, exist_ok=True)
-                    rec.write_text(f"date={time.strftime('%Y-%m-%d', time.gmtime())} secs=3600 usd={3600 * USD_PER_SEC:.2f} gpu={GPU} exit=timeout\n")
+                # The container was killed, so it left no spend record, but it billed every second it ran: the
+                # whole timeout for a timeout, otherwise the time since the batch started (a bound for one job).
+                timed_out = isinstance(result, modal.exception.FunctionTimeoutError)
+                secs = TIMEOUT_S if timed_out else time.time() - t_batch
+                rec = logs / "_spend" / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{type(result).__name__}.txt"
+                rec.parent.mkdir(parents=True, exist_ok=True)
+                rec.write_text(f"date={time.strftime('%Y-%m-%d', time.gmtime())} secs={secs:.0f} usd={secs * USD_PER_SEC:.2f} "
+                               f"gpu={GPU}x{N_GPUS} exit={'timeout' if timed_out else type(result).__name__ + '(estimated)'} ws={workspace}\n")
+                print(f"  ~${secs * USD_PER_SEC:.2f} of {N_GPUS}-GPU time recorded as spent.")
+                if "cancelled" in str(result):
+                    print("  'cancelled by user or a failure' after a local disconnect means Modal stopped the app when this\n"
+                          "  client dropped. Launch with `modal run --detach ...` so the run survives that, then `--fetch` the logs.")
                 continue
             tag, code, files, secs = result["tag"], result["code"], result["files"], result["secs"]
             for rel, text in files.items():

@@ -74,6 +74,7 @@ def read_run(d: Path):
         loss=curve[int(vals[-1][0])],
         curve=curve,
         ext=cfg.get("ext", "default"),
+        gpus=cfg.get("gpus", "1"),
         time_ms=float(times[-1]) if times else None,
         val_times={int(step): float(ms) for step, ms in VAL_TIME_RE.findall(text)},
         copy=copy,
@@ -180,14 +181,23 @@ def copy_mix_report(runs):
         print(f"  {r['name']:<44} {base:.6f} -> {mix:.6f}  gain {gain:+.6f}  (~{gain / LOSS_PER_STEP:.0f} steps)"
               + (f"  fit {fit_ms:.0f} ms on the clock = {fit_steps:.1f} steps" if fit_steps is not None else "")
               + (f"  matching {match_ms:.0f} ms off the clock" if match_ms else ""))
+        # The timing claim, from this run's own clock: the record runs 40 extension steps and no fit, so against
+        # it this run saved (40 - ext) of its own extension steps and paid for one fit. Same hardware by construction.
+        if fit_steps is not None and r["ext"].isdigit() and r["steps"] == "default":
+            saved = (40 - int(r["ext"])) * step_ms - fit_ms
+            print(f"  {'':<44} on {r['gpus']} GPU(s): extension step {step_ms:.1f} ms, so {40 - int(r['ext'])} fewer steps and one fit "
+                  f"= {saved / 1000:+.2f} s against the record ({saved / (r['val_times'][last] + saved):.2%})")
     # Rule 2 is judged on the loss a record reports, which for this change is the mixture's. Never pool
     # step counts: a shortened run and a full-length one are different submissions.
     by_steps = {}
     for r in runs:
-        by_steps.setdefault((r["steps"], r["ext"]), []).append(r["copy"][max(r["copy"])][:2])
-    for (steps, ext), pairs in sorted(by_steps.items()):
-        print("  " + summarize(f"model alone,  steps={steps} ext={ext}", [m for m, _ in pairs]))
-        print("  " + summarize(f"MIXTURE LOSS, steps={steps} ext={ext}", [x for _, x in pairs]))
+        by_steps.setdefault((r["steps"], r["ext"], r["gpus"]), []).append(r["copy"][max(r["copy"])][:2])
+    for (steps, ext, gpus), pairs in sorted(by_steps.items()):
+        print("  " + summarize(f"model alone,  steps={steps} ext={ext} gpus={gpus}", [m for m, _ in pairs]))
+        print("  " + summarize(f"MIXTURE LOSS, steps={steps} ext={ext} gpus={gpus}", [x for _, x in pairs]))
+    # Pool only full-schedule runs: a shortened smoke run is a different experiment with a huge, meaningless gain.
+    full = [i for i, r in enumerate(runs) if r["steps"] == "default"] or list(range(len(runs)))
+    gains, nets = [gains[i] for i in full], [nets[i] for i in full]
     spread = f" +/- {stdev(gains):.6f}" if len(gains) > 1 else ""
     net = mean(nets)
     verdict = ("DROP: below the smallest saving worth a PR" if net < DROP_STEPS else

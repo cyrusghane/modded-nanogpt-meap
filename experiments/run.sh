@@ -58,6 +58,7 @@ export COPY_MIX
 
 TAG="${ARM}_p${MASK_P_START}-${MASK_P_END}_seed${SEED}${STEPS:+_steps${STEPS}}${EXT:+_ext${EXT}}"
 [[ "$COPY_MIX" == "1" ]] && TAG="${TAG}_copymix"
+[[ "$GPUS" != "1" ]] && TAG="${TAG}_${GPUS}gpu"
 [[ "$REP" != "1" ]] && TAG="${TAG}_rep${REP}"
 OUT="${LOG_ROOT:-experiments/logs}/${TAG}"   # LOG_ROOT: remote launchers point this at persistent storage
 mkdir -p "$OUT"
@@ -92,6 +93,12 @@ fi
   echo "cpu:     $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)"
 } | tee "$OUT/config.txt"
 
-torchrun --standalone --nproc_per_node="$GPUS" "$SCRIPT" 2>&1 | tee "$OUT/train.log"
+if [[ "$GPUS" == "1" ]]; then
+  torchrun --standalone --nproc_per_node=1 "$SCRIPT" 2>&1 | tee "$OUT/train.log"
+else
+  # Each rank sees only its own GPU, as cuda:0, so all ranks of a run share one set of compile-cache
+  # entries (see experiments/one_gpu_per_rank.py). Same computation, different device numbering.
+  torchrun --standalone --nproc_per_node="$GPUS" "$(dirname "$0")/one_gpu_per_rank.py" "$SCRIPT" 2>&1 | tee "$OUT/train.log"
+fi
 
 echo "final: $(grep -E 'val_loss:[0-9.]+' "$OUT/train.log" | tail -1)"
